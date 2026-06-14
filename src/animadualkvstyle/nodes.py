@@ -119,11 +119,130 @@ def patch_attention_module(module):
             if rope_emb is None and len(args) >= 2:
                 rope_emb = args[1]
                 
-            # Apply each style patch sequentially
+            # Determine positive/negative chunks based on cond_or_uncond
+            cond_or_uncond = transformer_options.get("cond_or_uncond", None)
+            pos_indices = None
+            neg_index = None
+            if isinstance(cond_or_uncond, list):
+                pos_indices = [i for i, val in enumerate(cond_or_uncond) if val == 0]
+                if 1 in cond_or_uncond:
+                    neg_index = cond_or_uncond.index(1)
+
+            # Subset input x to only positive conditioning chunks to avoid useless negative style computation
+            x_pos = x
+            if pos_indices is not None and len(pos_indices) < x.shape[0]:
+                try:
+                    x_chunks = x.chunk(x.shape[0], dim=0)
+                    x_pos = torch.cat([x_chunks[i] for i in pos_indices], dim=0)
+                except Exception:
+                    pos_indices = None
+
+            # Compute cumulative style attention output only on the positive chunks
+            dummy_y = torch.zeros(x_pos.shape[0], y.shape[1], y.shape[2], dtype=y.dtype, device=y.device)
+            out_style_pos = dummy_y
             for patch in patches:
-                y = patch.apply(self, x, y, rope_emb)
-                
-            return y
+                out_style_pos = patch.apply(self, x_pos, out_style_pos, rope_emb)
+
+            # --- BEGIN Anima-NAG node compatibility branch ---
+            # This branch resolves compatibility with the ComfyUI-Anima-Nag node.
+            # Since both nodes patch the model configuration concurrently, we inspect the NAG node's
+            # optimized_attention_override function closure to dynamically retrieve the guidance parameters
+            # (scale, tau, alpha, and active sigma range) without modifying the external NAG repository.
+            nag_scale = nag_tau = nag_alpha = None
+            nag_override = transformer_options.get("optimized_attention_override", None)
+            if nag_override is not None and nag_override.__class__.__name__ == 'function':
+                try:
+                    # Dynamically inspect NAG's local variables captured within its attention_override closure
+                    free_vars = nag_override.__code__.co_freevars
+                    closure_dict = {
+                        name: cell.cell_contents
+                        for name, cell in zip(free_vars, nag_override.__closure__)
+                    }
+                    nag_scale = closure_dict.get("scale", None)
+                    nag_tau = closure_dict.get("tau", None)
+                    nag_alpha = closure_dict.get("alpha", None)
+                    sigma_start = closure_dict.get("sigma_start", None)
+                    sigma_end = closure_dict.get("sigma_end", None)
+                except Exception:
+                    pass
+
+            # Determine if Normalized Attention Guidance (NAG) is active for the current sampling step.
+            # NAG must have positive/negative chunks in the batch and the current step's sigma must fall 
+            # within the configured active sigma range.
+            is_nag_active_for_step = False
+            if (
+                nag_scale is not None and nag_scale > 0.0 and
+                nag_tau is not None and nag_alpha is not None and
+                pos_indices is not None and neg_index is not None
+            ):
+                sigmas = transformer_options.get("sigmas", None)
+                if sigmas is not None and len(sigmas) > 0:
+                    try:
+                        sigma_val = float(sigmas[0])
+                        if sigma_end < sigma_val <= sigma_start:
+                            is_nag_active_for_step = True
+                    except Exception:
+                        pass
+
+            if is_nag_active_for_step:
+                try:
+                    # Under NAG, we apply guidance and normalization parameters to the positive chunks of the style LoRA.
+                    # This ensures the style features are scaled by the NAG normalization ratio so they do not
+                    # overpower the guided prompt or cause prompt distortion.
+                    y_chunks = y.chunk(len(cond_or_uncond), dim=0)
+                    out_style_pos_chunks = out_style_pos.chunk(len(pos_indices), dim=0)
+
+                    y_neg_base = torch.cat([y_chunks[neg_index]] * len(pos_indices), dim=0)
+                    out_chunks = list(y_chunks)
+
+                    for i, pos_index in enumerate(pos_indices):
+                        y_pos_base = y_chunks[pos_index]
+                        style_pos = out_style_pos_chunks[i]
+
+                        # 1. Compute the guided positive branch output (base attention + guided prompt subtraction)
+                        y_tilde_base = y_pos_base + nag_scale * (y_pos_base - y_neg_base)
+
+                        # 2. Compute norms of the combined positive branch (base + style) to evaluate the scaling ratio
+                        eps = 1e-6
+                        norm_pos = torch.norm(y_pos_base + style_pos, p=1, dim=-1, keepdim=True).clamp_min(eps)
+                        norm_tilde = torch.norm(y_tilde_base + style_pos, p=1, dim=-1, keepdim=True).clamp_min(eps)
+
+                        # 3. Calculate NAG's normalization ratio and final blend scaling factor
+                        ratio = norm_tilde / norm_pos
+                        scaling_factor = nag_alpha * (torch.minimum(ratio, torch.full_like(ratio, nag_tau)) / ratio) + (1.0 - nag_alpha)
+
+                        # 4. Scale the positive style output chunk and combine it
+                        out_chunks[pos_index] = y_pos_base + scaling_factor * style_pos
+
+                    # The negative chunk remains completely clean (Option A: no style added to the unconditioned branch)
+                    out_chunks[neg_index] = y_chunks[neg_index]
+
+                    return torch.cat(out_chunks, dim=0)
+                except Exception as e:
+                    # Fallback to standard addition in case of unexpected execution failures
+                    print(f"[AnimaDualKVStyle] NAG compatibility error, falling back: {e}")
+                    return y + out_style_pos
+            # --- END Anima-NAG node compatibility branch ---
+
+            # Default branch: positive-only style addition
+            try:
+                if pos_indices is not None:
+                    y_chunks = y.chunk(y.shape[0], dim=0)
+                    out_style_pos_chunks = out_style_pos.chunk(len(pos_indices), dim=0)
+
+                    out_chunks = list(y_chunks)
+                    for i, pos_index in enumerate(pos_indices):
+                        out_chunks[pos_index] = y_chunks[pos_index] + out_style_pos_chunks[i]
+
+                    # Negative chunk remains completely clean
+                    if neg_index is not None:
+                        out_chunks[neg_index] = y_chunks[neg_index]
+
+                    return torch.cat(out_chunks, dim=0)
+            except Exception:
+                pass
+
+            return y + out_style_pos
             
         module.forward = types.MethodType(custom_forward, module)
 
