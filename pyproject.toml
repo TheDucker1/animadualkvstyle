@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "animadualkvstyle"
-version = "0.0.2"
+version = "0.0.3"
 description = "Custom node to load custom anima lora"
 authors = [
   {name = "TD", email = "minhduck3359@gmail.com"}
